@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package custom_detectors;
+
+option go_package = "github.com/trufflesecurity/trufflehog/v3/pkg/pb/custom_detectorspb";
+
+import "validate/validate.proto";
+
+message CustomDetectors {
+  repeated CustomRegex detectors = 1;
+}
+
+message CustomRegex {
+  string name = 1;
+  repeated string keywords = 2;
+  map<string, string> regex = 3;
+  repeated VerifierConfig verify = 4;
+  string description = 5;
+  repeated string exclude_regexes_capture = 6;
+  repeated string exclude_words = 7;
+  float entropy = 8;
+  repeated string exclude_regexes_match = 9;
+  string primary_regex_name = 10;
+  map<string, ValidationConfig> validations = 11;
+}
+
+
+message VerifierConfig {
+  string endpoint = 1 [(validate.rules).string.uri_ref = true];
+  bool unsafe = 2;
+  repeated string headers = 3;
+  repeated string successRanges = 4;
+  repeated string rotatedRanges = 5;
+  // Optional authentication for verification requests, for endpoints that
+  // sit behind an auth proxy.
+  VerifierAuth auth = 6;
+}
+
+// VerifierAuth selects how verification requests authenticate to the auth
+// proxy in front of the verification endpoint. Exactly one mechanism may be
+// set.
+message VerifierAuth {
+  oneof auth_config {
+    OAuth2Config oauth2 = 1;
+  }
+}
+
+// OAuth2Config obtains an access token from an OAuth2 identity provider and
+// attaches it to every verification request sent to a configured endpoint.
+message OAuth2Config {
+  // Token endpoint of the identity provider. Must be HTTPS unless the
+  // verifier is marked unsafe.
+  string token_endpoint = 1;
+  oneof grant_config {
+    ROPCConfig ropc = 2;
+  }
+  // Request header that carries the access token as "Bearer <token>".
+  // Defaults to "Authorization". Detectors that send the secret under test
+  // in Authorization need a different header here, because the token is
+  // never allowed to overwrite a header the detector set.
+  string token_header = 3;
+}
+
+// ROPCConfig holds credentials for the OAuth2 Resource Owner Password
+// Credentials grant (RFC 6749 section 4.3).
+message ROPCConfig {
+  string username = 1;
+  string password = 2;
+  string client_id = 3;
+  string client_secret = 4;
+  // Space-separated scopes to request. Empty requests no scope.
+  string scope = 5;
+}
+
+message ValidationConfig {
+  bool contains_digit = 1;
+  bool contains_lowercase = 2;
+  bool contains_uppercase = 3;
+  bool contains_special_char = 4;
+}

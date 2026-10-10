@@ -1,0 +1,122 @@
+package jiratoken
+
+import (
+	"cmp"
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+
+	regexp "github.com/wasilibs/go-re2"
+
+	"github.com/trufflesecurity/trufflehog/v3/pkg/common"
+	"github.com/trufflesecurity/trufflehog/v3/pkg/detectors"
+	v1 "github.com/trufflesecurity/trufflehog/v3/pkg/detectors/jiratoken/v1"
+	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/detector_typepb"
+)
+
+type Scanner struct {
+	client *http.Client
+	detectors.DefaultMultiPartCredentialProvider
+	detectors.EndpointSetter
+}
+
+// Ensure the Scanner satisfies the interface at compile time.
+var _ detectors.Detector = (*Scanner)(nil)
+var _ detectors.Versioner = (*Scanner)(nil)
+var _ detectors.EndpointCustomizer = (*Scanner)(nil)
+var _ detectors.CloudProvider = (*Scanner)(nil)
+
+func (Scanner) Version() int { return 2 }
+
+func (Scanner) CloudEndpoint() string { return "https://" + v1.CloudHost }
+
+var (
+	defaultClient = detectors.DetectorHttpClientWithLocalAddresses
+
+	// https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/
+	// Tokens created after Jan 18 2023 use a variable length
+	tokenPat  = regexp.MustCompile(`\b(ATATT[A-Za-z0-9+/=_-]+=[A-Za-z0-9]{8})\b`)
+	domainPat = regexp.MustCompile(`\b((?:[a-zA-Z0-9-]{1,24}\.)+[a-zA-Z0-9-]{2,24}\.[a-zA-Z0-9-]{2,16})\b`)
+	emailPat  = regexp.MustCompile(common.EmailPattern)
+)
+
+func (s Scanner) getClient() *http.Client {
+	return s.VerificationClient(cmp.Or(s.client, defaultClient))
+}
+
+// Keywords are used for efficiently pre-filtering chunks.
+// Use identifiers in the secret preferably, or the provider name.
+func (s Scanner) Keywords() []string {
+	return []string{"atlassian", "confluence", "jira"}
+}
+
+// FromData will find and optionally verify JiraToken secrets in a given set of bytes.
+func (s Scanner) FromData(ctx context.Context, verify bool, data []byte) (results []detectors.Result, err error) {
+	dataStr := string(data)
+
+	var uniqueTokens, uniqueDomains, uniqueEmails = make(map[string]struct{}), make(map[string]struct{}), make(map[string]struct{})
+
+	for _, token := range tokenPat.FindAllStringSubmatch(dataStr, -1) {
+		uniqueTokens[token[1]] = struct{}{}
+	}
+
+	for _, domain := range domainPat.FindAllStringSubmatch(dataStr, -1) {
+		uniqueDomains[domain[1]] = struct{}{}
+	}
+
+	for _, email := range emailPat.FindAllStringSubmatch(dataStr, -1) {
+		uniqueEmails[strings.ToLower(email[1])] = struct{}{}
+	}
+
+	// domainPat here is not even keyword-gated, so it captures every domain in the chunk.
+	found := v1.FoundHosts(uniqueDomains)
+	hosts := v1.VerificationHosts(s.Endpoints(found...), found)
+
+	for email := range uniqueEmails {
+		for token := range uniqueTokens {
+			for _, domain := range hosts {
+				s1 := detectors.Result{
+					DetectorType: detector_typepb.DetectorType_JiraToken,
+					Raw:          []byte(token),
+					RawV2:        fmt.Appendf(nil, "%s:%s:%s", email, token, domain),
+					ExtraData: map[string]string{
+						"rotation_guide": "https://howtorotate.com/docs/tutorials/atlassian/",
+						"version":        fmt.Sprintf("%d", s.Version()),
+					},
+					SecretParts: map[string]string{
+						"token":  token,
+						"domain": domain,
+						"email":  email,
+					},
+				}
+
+				if verify {
+					client := s.getClient()
+					isVerified, verificationErr := v1.VerifyJiraToken(ctx, client, email, domain, token)
+					s1.Verified = isVerified
+					s1.SetVerificationError(verificationErr, token)
+
+					// The credential is the same across endpoints, so once one of them verifies it there
+					// is nothing to learn from the rest.
+					if s1.Verified {
+						results = append(results, s1)
+						break
+					}
+				}
+
+				results = append(results, s1)
+			}
+		}
+	}
+
+	return results, nil
+}
+
+func (s Scanner) Type() detector_typepb.DetectorType {
+	return detector_typepb.DetectorType_JiraToken
+}
+
+func (s Scanner) Description() string {
+	return "Jira is a proprietary issue tracking product developed by Atlassian that allows bug tracking and agile project management. Jira tokens can be used to authenticate API requests."
+}

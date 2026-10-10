@@ -1,0 +1,452 @@
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"net"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/lib/pq"
+	regexp "github.com/wasilibs/go-re2"
+
+	"github.com/trufflesecurity/trufflehog/v3/pkg/common"
+	"github.com/trufflesecurity/trufflehog/v3/pkg/detectors"
+	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/detector_typepb"
+)
+
+const (
+	defaultPort = "5432"
+
+	pgConnectTimeout = "connect_timeout"
+	pgDbname         = "dbname"
+	pgHost           = "host"
+	pgPassword       = "password"
+	pgPort           = "port"
+	pgRequiressl     = "requiressl"
+	pgSslmode        = "sslmode"
+	pgSslmodeAllow   = "allow"
+	pgSslmodeDisable = "disable"
+	pgSslmodePrefer  = "prefer"
+	pgSslmodeRequire = "require"
+	pgUser           = "user"
+	pgDbType         = "db_type"
+)
+
+// nonConnectionParams are query-string arguments that ORMs append to
+// Postgres connection URIs but that are not libpq connection keywords. lib/pq and pgx
+// forward any key they don't recognize to the server as a startup runtime parameter,
+// which the server rejects with 42704. Exluding them prevents this
+var nonConnectionParams = map[string]struct{}{
+	"schema":           {}, // Prisma: search_path selector
+	"connection_limit": {}, // Prisma: client-side pool size
+	"pool_timeout":     {}, // Prisma: pool-acquisition wait
+	"socket_timeout":   {}, // Prisma: per-query timeout
+	"pgbouncer":        {}, // Prisma: PgBouncer compatibility mode
+	"sslidentity":      {}, // Prisma: PKCS12 certificate path
+}
+
+func isNonConnectionParam(key string) bool {
+	_, ok := nonConnectionParams[key]
+	return ok
+}
+
+// This detector currently only finds Postgres connection string URIs
+// (https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING-URIS) When it finds one, it uses
+// pq.ParseURI to normalize this into space-separated key-value pair Postgres connection string, and then uses a regular
+// expression to transform this connection string into a parameters map. This parameters map is manipulated prior to
+// verification, which operates by transforming the map back into a space-separated kvp connection string. This is kind
+// of clunky overall, but it has the benefit of preserving the connection string as a map when it needs to be modified,
+// which is much nicer than having to patch a space-separated string of kvps.
+
+// Multi-host connection string URIs are currently not supported because pq.ParseURI doesn't parse them correctly. If we
+// happen to run into a case where this matters we can address it then.
+var (
+	_          detectors.Detector = (*Scanner)(nil)
+	uriPattern                    = regexp.MustCompile(`\b(?i)(postgres(?:ql)?)://\S+\b`)
+	connStrPartPattern = regexp.MustCompile(`([[:alpha:]_]+)='(.+?)' ?`)
+)
+
+type Scanner struct {
+	detectors.DefaultMultiPartCredentialProvider
+	detectLoopback bool // Automated tests run against localhost, but we want to ignore those results in the wild
+	ignorePatterns []*regexp.Regexp
+}
+
+type uriMatch struct {
+	params map[string]string
+	rawURI string
+}
+
+func New(opts ...func(*Scanner)) *Scanner {
+	scanner := &Scanner{
+		ignorePatterns: []*regexp.Regexp{},
+	}
+	for _, opt := range opts {
+		opt(scanner)
+	}
+
+	return scanner
+}
+
+func WithIgnorePattern(ignoreStrings []string) func(*Scanner) {
+	return func(s *Scanner) {
+		var ignorePatterns []*regexp.Regexp
+		for _, ignoreString := range ignoreStrings {
+			ignorePattern, err := regexp.Compile(ignoreString)
+			if err != nil {
+				panic(fmt.Sprintf("%s is not a valid regex, error received: %v", ignoreString, err))
+			}
+			ignorePatterns = append(ignorePatterns, ignorePattern)
+		}
+
+		s.ignorePatterns = ignorePatterns
+	}
+}
+
+var _ detectors.Detector = (*Scanner)(nil)
+var _ detectors.CustomFalsePositiveChecker = (*Scanner)(nil)
+
+func (s Scanner) Keywords() []string {
+	return []string{"postgres"}
+}
+
+func (s Scanner) FromData(ctx context.Context, verify bool, data []byte) ([]detectors.Result, error) {
+	var results []detectors.Result
+	candidateURIs := findUriMatches(data, s.ignorePatterns)
+
+	for _, candidateURI := range candidateURIs {
+		if common.IsDone(ctx) {
+			break
+		}
+		params := candidateURI.params
+		user, ok := params[pgUser]
+		if !ok {
+			continue
+		}
+
+		password, ok := params[pgPassword]
+		if !ok {
+			continue
+		}
+
+		host, ok := params[pgHost]
+		if !ok {
+			continue
+		}
+		if !s.detectLoopback {
+			if host == "localhost" {
+				continue
+			}
+			if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+				continue
+			}
+		}
+
+		port, ok := params[pgPort]
+		if !ok {
+			port = defaultPort
+			params[pgPort] = port
+		}
+
+		const defaultDBType = "postgresql"
+		dbType, ok := params[pgDbType]
+		if !ok {
+			dbType = defaultDBType
+		}
+		raw := []byte(fmt.Sprintf("%s://%s:%s@%s:%s", dbType, user, password, host, port))
+
+		result := detectors.Result{
+			DetectorType: detector_typepb.DetectorType_Postgres,
+			Raw:          raw,
+			RawV2:        raw,
+			SecretParts:  map[string]string{"connection_string": string(raw)},
+		}
+		// Set the un-normalized raw match as the primary secret value.
+		// This ensures that the engine's line-offset and ignore-tag matching logic
+		// (which searches the source document for the exact string) can locate the match,
+		// even though Raw/RawV2 are stored in a normalized form.
+		result.SetPrimarySecretValue(candidateURI.rawURI)
+
+		// We don't need to normalize the (deprecated) requiressl option into the (up-to-date) sslmode option - pq can
+		// do it for us - but we will do it anyway here so that when we later capture sslmode into ExtraData we will
+		// capture it post-normalization. (The detector's behavior is undefined for candidate secrets that have both
+		// requiressl and sslmode set.)
+		if requiressl := params[pgRequiressl]; requiressl == "0" {
+			params[pgSslmode] = pgSslmodePrefer
+		} else if requiressl == "1" {
+			params[pgSslmode] = pgSslmodeRequire
+		}
+
+		if verify {
+			// pq appears to ignore the context deadline, so we copy any timeout that's been set into the connection
+			// parameters themselves.
+			timeout, hasDeadline := getDeadlineInSeconds(ctx)
+			if hasDeadline && timeout <= 0 {
+				// The deadline has already passed, so this credential cannot be tested. Report it as indeterminate
+				// rather than abandoning this candidate and every remaining one. The IsDone check at the top of the
+				// loop ends the scan on the next iteration.
+				result.SetVerificationError(context.DeadlineExceeded, password)
+			} else {
+				if hasDeadline {
+					params[pgConnectTimeout] = strconv.Itoa(timeout)
+				}
+
+				isVerified, verificationErr := verifyPostgres(ctx, params)
+				result.Verified = isVerified
+				result.SetVerificationError(verificationErr, password)
+			}
+		}
+
+		// We gather SSL information into ExtraData in case it's useful for later reporting.
+		sslmode := params[pgSslmode]
+		if sslmode == "" {
+			sslmode = "<unset>"
+		}
+		result.ExtraData = map[string]string{
+			pgSslmode: sslmode,
+		}
+		if host != "" {
+			if port != "" {
+				result.ExtraData["host"] = host + ":" + port
+			} else {
+				result.ExtraData["host"] = host
+			}
+		}
+		if user != "" {
+			result.ExtraData["username"] = user
+		}
+		if dbname := params[pgDbname]; dbname != "" {
+			result.ExtraData["database"] = dbname
+		}
+
+		results = append(results, result)
+	}
+
+	return results, nil
+}
+
+func (s Scanner) IsFalsePositive(_ detectors.Result) (bool, string) {
+	return false, ""
+}
+
+func findUriMatches(data []byte, ignorePatterns []*regexp.Regexp) []uriMatch {
+	var matches []uriMatch
+	for _, uri := range uriPattern.FindAll(data, -1) {
+		if shouldIgnore(uri, ignorePatterns) {
+			continue
+		}
+		// Capture the database type (e.g., "postgres" or "postgresql")
+		dbTypeMatch := uriPattern.FindSubmatch(uri)
+		if len(dbTypeMatch) < 2 {
+			continue
+		}
+		dbType := string(dbTypeMatch[1])
+
+		connStr, err := pq.ParseURL(string(uri))
+		if err != nil {
+			continue
+		}
+
+		parts := connStrPartPattern.FindAllStringSubmatch(connStr, -1)
+		params := make(map[string]string, len(parts))
+		for _, part := range parts {
+			params[part[1]] = part[2]
+		}
+
+		params[pgDbType] = dbType
+		matches = append(matches, uriMatch{
+			params: params,
+			rawURI: string(uri),
+		})
+	}
+	return matches
+}
+
+func shouldIgnore(uri []byte, ignorePatterns []*regexp.Regexp) bool {
+	for _, ignore := range ignorePatterns {
+		if ignore.Match(uri) {
+			return true
+		}
+	}
+	return false
+}
+
+// isNeonHost reports whether host is a Neon managed-Postgres endpoint.
+// Neon advertises SCRAM-SHA-256 with iteration count i=1; lib/pq rejects that,
+// so verification for these hosts uses pgx instead (SCAN-1020).
+func isNeonHost(host string) bool {
+	return strings.HasSuffix(strings.ToLower(host), ".neon.tech")
+}
+
+// getDeadlineInSeconds gets the deadline from the context in seconds. If there
+// is no deadline, false is returned. If the deadline is already exceeded, a
+// negative or 0 value will be returned.
+func getDeadlineInSeconds(ctx context.Context) (int, bool) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		// Context does not have a deadline.
+		return 0, false
+	}
+
+	duration := time.Until(deadline)
+	return int(duration.Seconds()), true
+}
+
+// The server looks the database up only after authenticating, so this confirms the credentials.
+const invalidCatalogName = "3D000"
+
+// Message text is only a fallback, for proxies that relay a failure without a SQLSTATE; the server
+// translates messages per lc_messages. Postgres substitutes the user name, not "postgres", when a
+// connection string names no database (src/backend/tcop/backend_startup.c).
+func isErrorDatabaseNotFound(err error, params map[string]string) bool {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) && pqErr.Code == invalidCatalogName {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == invalidCatalogName {
+		return true
+	}
+
+	dbName := params[pgDbname]
+	if dbName == "" {
+		dbName = params[pgUser]
+	}
+	if dbName == "" {
+		return false
+	}
+
+	return strings.Contains(err.Error(), fmt.Sprintf("database %q does not exist", dbName))
+}
+
+func verifyPostgres(ctx context.Context, params map[string]string) (bool, error) {
+	// Neon (managed Postgres) advertises SCRAM-SHA-256 with iteration count i=1.
+	// lib/pq rejects iteration fields shorter than 6 chars, which traps these
+	// secrets in indeterminate reverification. pgx accepts any iterations > 0.
+	if isNeonHost(params[pgHost]) {
+		return verifyPostgresPgx(ctx, params)
+	}
+	return verifyPostgresPq(params)
+}
+
+// verifyPostgresPgx verifies credentials with jackc/pgx. Used for Neon hosts
+// where lib/pq's SCRAM client cannot complete the handshake (SCAN-1020).
+func verifyPostgresPgx(ctx context.Context, params map[string]string) (bool, error) {
+	conn, err := pgx.Connect(ctx, pgxConnString(params))
+	if err != nil {
+		return classifyPostgresVerifyError(err, params)
+	}
+	defer func() {
+		// Best-effort close after verification; the verify outcome is already decided.
+		if closeErr := conn.Close(ctx); closeErr != nil {
+			return
+		}
+	}()
+
+	if err := conn.Ping(ctx); err != nil {
+		return classifyPostgresVerifyError(err, params)
+	}
+	return true, nil
+}
+
+// pgxConnString builds a libpq-style connection string for pgx, omitting keys
+// that are detector-only (db_type) or libpq client options pgx would forward as
+// unrecognized server GUCs (requiressl). sslmode is already normalized in FromData.
+func pgxConnString(params map[string]string) string {
+	var connStr strings.Builder
+	for key, value := range params {
+		if key == pgDbType || key == pgRequiressl || isNonConnectionParam(key) {
+			continue
+		}
+		fmt.Fprintf(&connStr, "%s='%s'", key, value)
+	}
+	return connStr.String()
+}
+
+func classifyPostgresVerifyError(err error, params map[string]string) (bool, error) {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "28P01": // invalid_password
+			return false, nil
+		case "3D000": // invalid_catalog_name — authenticated, DB missing
+			return true, nil
+		}
+	}
+	if strings.Contains(err.Error(), "password authentication failed") {
+		return false, nil
+	}
+	if isErrorDatabaseNotFound(err, params) {
+		return true, nil
+	}
+	return false, err
+}
+
+func verifyPostgresPq(params map[string]string) (bool, error) {
+	if sslmode := params[pgSslmode]; sslmode == pgSslmodeAllow || sslmode == pgSslmodePrefer {
+		// pq doesn't support 'allow' or 'prefer'. If we find either of them, we'll just ignore it. This will trigger
+		// the same logic that is run if no sslmode is set at all (which mimics 'prefer', which is the default).
+		delete(params, pgSslmode)
+
+		// We still want to save the original sslmode in ExtraData, so we'll re-add it before returning.
+		defer func() {
+			params[pgSslmode] = sslmode
+		}()
+	}
+
+	// db_type is not a valid configuration parameter, so we remove it before connecting.
+	dbType := params[pgDbType]
+	delete(params, pgDbType)
+
+	// we re-add it before returning to preserve in ExtraData
+	defer func() {
+		params[pgDbType] = dbType
+	}()
+
+	var connStr string
+	for key, value := range params {
+		if isNonConnectionParam(key) {
+			continue
+		}
+		connStr += fmt.Sprintf("%s='%s'", key, value)
+	}
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = db.Close() }()
+
+	err = db.Ping()
+	switch {
+	case err == nil:
+		return true, nil
+	case strings.Contains(err.Error(), "password authentication failed"):
+		return false, nil
+	case errors.Is(err, pq.ErrSSLNotSupported) && params[pgSslmode] == "":
+		// If the sslmode is unset, then either it was unset in the candidate secret, or we've intentionally unset it
+		// because it was specified as 'allow' or 'prefer', neither of which pq supports. In all of these cases, non-SSL
+		// connections are acceptable, so now we try a connection without SSL.
+		params[pgSslmode] = pgSslmodeDisable
+		defer delete(params, pgSslmode) // We want to return with the original params map intact (for ExtraData)
+		return verifyPostgresPq(params)
+	case isErrorDatabaseNotFound(err, params):
+		return true, nil // If we know this, we were able to authenticate
+	default:
+		return false, err
+	}
+}
+
+func (s Scanner) Type() detector_typepb.DetectorType {
+	return detector_typepb.DetectorType_Postgres
+}
+
+func (s Scanner) Description() string {
+	return "Postgres connection string containing credentials"
+}
